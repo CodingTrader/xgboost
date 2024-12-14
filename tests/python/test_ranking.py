@@ -202,6 +202,12 @@ def test_unbiased() -> None:
     # less biased on low ranks.
     assert df["ti+"].iloc[-1] < df["ti+"].iloc[0]
 
+    # Training continuation
+    ltr.fit(x, c, qid=q, eval_set=[(x, c)], eval_qid=[q], xgb_model=ltr)
+    # normalized
+    np.testing.assert_allclose(df["ti+"].iloc[0], 1.0)
+    np.testing.assert_allclose(df["tj-"].iloc[0], 1.0)
+
 
 def test_normalization() -> None:
     run_normalization("cpu")
@@ -213,7 +219,7 @@ class TestRanking:
         """
         Download and setup the test fixtures
         """
-        cls.dpath = 'demo/rank/'
+        cls.dpath = "demo/"
         (x_train, y_train, qid_train, x_test, y_test, qid_test,
          x_valid, y_valid, qid_valid) = tm.data.get_mq2008(cls.dpath)
 

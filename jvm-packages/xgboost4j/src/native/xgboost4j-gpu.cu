@@ -97,7 +97,7 @@ void CopyInterface(std::vector<xgboost::ArrayInterface<1>> &interface_arr,
         Json{Boolean{false}}};
 
     out["data"] = Array(std::move(j_data));
-    out["shape"] = Array(std::vector<Json>{Json(Integer(interface.Shape(0)))});
+    out["shape"] = Array(std::vector<Json>{Json(Integer(interface.Shape<0>()))});
 
     if (interface.valid.Data()) {
       CopyColumnMask(interface, columns, kind, c, &mask, &out, stream);
@@ -113,7 +113,7 @@ void CopyMetaInfo(Json *p_interface, dh::device_vector<T> *out, cudaStream_t str
   CHECK_EQ(get<Array const>(j_interface).size(), 1);
   auto object = get<Object>(get<Array>(j_interface)[0]);
   ArrayInterface<1> interface(object);
-  out->resize(interface.Shape(0));
+  out->resize(interface.Shape<0>());
   size_t element_size = interface.ElementSize();
   size_t size = element_size * interface.n;
   dh::safe_cuda(cudaMemcpyAsync(RawPtr(*out), interface.data, size,
@@ -404,28 +404,14 @@ template <typename T>
 using Deleter = std::function<void(T *)>;
 } // anonymous namespace
 
-XGB_DLL int XGDeviceQuantileDMatrixCreateFromCallbackImpl(JNIEnv *jenv, jclass jcls,
-                                                           jobject jiter,
-                                                           jfloat jmissing,
-                                                           jint jmax_bin, jint jnthread,
-                                                           jlongArray jout) {
-  xgboost::jni::DataIteratorProxy proxy(jiter);
-  DMatrixHandle result;
-  auto ret = XGDeviceQuantileDMatrixCreateFromCallback(
-      &proxy, proxy.GetDMatrixHandle(), Reset, Next, jmissing, jnthread,
-      jmax_bin, &result);
-  setHandle(jenv, jout, result);
-  return ret;
-}
-
-XGB_DLL int XGQuantileDMatrixCreateFromCallbackImpl(JNIEnv *jenv, jclass jcls,
-                                                     jobject jdata_iter, jlongArray jref,
-                                                     char const *config, jlongArray jout) {
+XGB_DLL int XGQuantileDMatrixCreateFromCallbackImpl(JNIEnv *jenv, jclass, jobject jdata_iter,
+                                                    jlongArray jref, char const *config,
+                                                    jlongArray jout) {
   xgboost::jni::DataIteratorProxy proxy(jdata_iter);
   DMatrixHandle result;
   DMatrixHandle ref{nullptr};
 
-  if (jref != NULL) {
+  if (jref != nullptr) {
     std::unique_ptr<jlong, Deleter<jlong>> refptr{jenv->GetLongArrayElements(jref, nullptr),
                                                   [&](jlong *ptr) {
                                                     jenv->ReleaseLongArrayElements(jref, ptr, 0);
@@ -434,8 +420,8 @@ XGB_DLL int XGQuantileDMatrixCreateFromCallbackImpl(JNIEnv *jenv, jclass jcls,
     ref = reinterpret_cast<DMatrixHandle>(refptr.get()[0]);
   }
 
-  auto ret = XGQuantileDMatrixCreateFromCallback(
-      &proxy, proxy.GetDMatrixHandle(), ref, Reset, Next, config, &result);
+  auto ret = XGQuantileDMatrixCreateFromCallback(&proxy, proxy.GetDMatrixHandle(), ref, Reset, Next,
+                                                 config, &result);
   setHandle(jenv, jout, result);
   return ret;
 }

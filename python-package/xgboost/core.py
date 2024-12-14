@@ -26,6 +26,7 @@ from typing import (
     Sequence,
     Tuple,
     Type,
+    TypeGuard,
     TypeVar,
     Union,
     cast,
@@ -35,6 +36,12 @@ from typing import (
 import numpy as np
 import scipy.sparse
 
+from ._data_utils import (
+    array_interface,
+    cuda_array_interface,
+    from_array_interface,
+    make_array_interface,
+)
 from ._typing import (
     _T,
     ArrayLike,
@@ -53,10 +60,11 @@ from ._typing import (
     IterationRange,
     ModelIn,
     NumpyOrCupy,
+    PathLike,
     TransformedData,
     c_bst_ulong,
 )
-from .compat import PANDAS_INSTALLED, DataFrame, import_cupy, py_str
+from .compat import PANDAS_INSTALLED, DataFrame, py_str
 from .libpath import find_lib_path
 
 
@@ -156,7 +164,11 @@ def _log_callback(msg: bytes) -> None:
     """Redirect logs from native library into Python console"""
     smsg = py_str(msg)
     if smsg.find("WARNING:") != -1:
-        warnings.warn(smsg, UserWarning)
+        # Stacklevel:
+        # 1: This line
+        # 2: XGBoost C functions like `_LIB.XGBoosterTrainOneIter`.
+        # 3: The Python function that calls the C function.
+        warnings.warn(smsg, UserWarning, stacklevel=3)
         return
     print(smsg)
 
@@ -371,20 +383,6 @@ def _numpy2ctypes_type(dtype: Type[np.number]) -> Type[CNumeric]:
     return _NUMPY_TO_CTYPES_MAPPING[dtype]
 
 
-def _array_hasobject(data: DataType) -> bool:
-    return hasattr(data.dtype, "hasobject") and data.dtype.hasobject
-
-
-def _cuda_array_interface(data: DataType) -> bytes:
-    if _array_hasobject(data):
-        raise ValueError("Input data contains `object` dtype.  Expecting numeric data.")
-    interface = data.__cuda_array_interface__
-    if "mask" in interface:
-        interface["mask"] = interface["mask"].__cuda_array_interface__
-    interface_str = bytes(json.dumps(interface), "utf-8")
-    return interface_str
-
-
 def ctypes2numpy(cptr: CNumericPtr, length: int, dtype: Type[np.number]) -> np.ndarray:
     """Convert a ctypes pointer array to a numpy array."""
     ctype: Type[CNumeric] = _numpy2ctypes_type(dtype)
@@ -419,76 +417,6 @@ def c_array(
     if isinstance(values, np.ndarray) and values.dtype.itemsize == ctypes.sizeof(ctype):
         return values.ctypes.data_as(ctypes.POINTER(ctype))
     return (ctype * len(values))(*values)
-
-
-def from_array_interface(interface: dict) -> NumpyOrCupy:
-    """Convert array interface to numpy or cupy array"""
-
-    class Array:  # pylint: disable=too-few-public-methods
-        """Wrapper type for communicating with numpy and cupy."""
-
-        _interface: Optional[dict] = None
-
-        @property
-        def __array_interface__(self) -> Optional[dict]:
-            return self._interface
-
-        @__array_interface__.setter
-        def __array_interface__(self, interface: dict) -> None:
-            self._interface = copy.copy(interface)
-            # converts some fields to tuple as required by numpy
-            self._interface["shape"] = tuple(self._interface["shape"])
-            self._interface["data"] = tuple(self._interface["data"])
-            if self._interface.get("strides", None) is not None:
-                self._interface["strides"] = tuple(self._interface["strides"])
-
-        @property
-        def __cuda_array_interface__(self) -> Optional[dict]:
-            return self.__array_interface__
-
-        @__cuda_array_interface__.setter
-        def __cuda_array_interface__(self, interface: dict) -> None:
-            self.__array_interface__ = interface
-
-    arr = Array()
-
-    if "stream" in interface:
-        # CUDA stream is presented, this is a __cuda_array_interface__.
-        arr.__cuda_array_interface__ = interface
-        out = import_cupy().array(arr, copy=True)
-    else:
-        arr.__array_interface__ = interface
-        out = np.array(arr, copy=True)
-
-    return out
-
-
-def make_array_interface(
-    ptr: CNumericPtr, shape: Tuple[int, ...], dtype: Type[np.number], is_cuda: bool
-) -> Dict[str, Union[int, tuple, None]]:
-    """Make an __(cuda)_array_interface__ from a pointer."""
-    # Use an empty array to handle typestr and descr
-    if is_cuda:
-        empty = import_cupy().empty(shape=(0,), dtype=dtype)
-        array = empty.__cuda_array_interface__  # pylint: disable=no-member
-    else:
-        empty = np.empty(shape=(0,), dtype=dtype)
-        array = empty.__array_interface__  # pylint: disable=no-member
-
-    addr = ctypes.cast(ptr, ctypes.c_void_p).value
-    length = int(np.prod(shape))
-    # Handle empty dataset.
-    assert addr is not None or length == 0
-
-    if addr is None:
-        return array
-
-    array["data"] = (addr, True)
-    if is_cuda:
-        array["stream"] = 2
-    array["shape"] = shape
-    array["strides"] = None
-    return array
 
 
 def _prediction_output(
@@ -534,7 +462,22 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
 
         .. warning::
 
-            This is an experimental parameter.
+            This is an experimental parameter and subject to change.
+
+    min_cache_page_bytes :
+        The minimum number of bytes of each cached pages. Only used for on-host cache
+        with GPU-based :py:class:`ExtMemQuantileDMatrix`. When using GPU-based external
+        memory with the data cached in the host memory, XGBoost can concatenate the
+        pages internally to increase the batch size for the GPU. The default page size
+        is about 1/8 of the total device memory. Users can manually set the value based
+        on the actual hardware and datasets. Set this to 0 to disable page
+        concatenation.
+
+        .. versionadded:: 3.0.0
+
+        .. warning::
+
+            This is an experimental parameter and subject to change.
 
     """
 
@@ -542,10 +485,13 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
         self,
         cache_prefix: Optional[str] = None,
         release_data: bool = True,
+        *,
         on_host: bool = True,
+        min_cache_page_bytes: Optional[int] = None,
     ) -> None:
         self.cache_prefix = cache_prefix
         self.on_host = on_host
+        self.min_cache_page_bytes = min_cache_page_bytes
 
         self._handle = _ProxyDMatrix()
         self._exception: Optional[Exception] = None
@@ -665,7 +611,7 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
         if self._release:
             self._temporary_data = None
         # pylint: disable=not-callable
-        return self._handle_exception(lambda: self.next(input_data), 0)
+        return self._handle_exception(lambda: int(self.next(input_data)), 0)
 
     @abstractmethod
     def reset(self) -> None:
@@ -673,7 +619,7 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
         raise NotImplementedError()
 
     @abstractmethod
-    def next(self, input_data: Callable) -> int:
+    def next(self, input_data: Callable) -> bool:
         """Set the next batch of data.
 
         Parameters
@@ -685,7 +631,7 @@ class DataIter(ABC):  # pylint: disable=too-many-instance-attributes
 
         Returns
         -------
-        0 if there's no more batch, otherwise 1.
+        False if there's no more batch, otherwise True.
 
         """
         raise NotImplementedError()
@@ -940,6 +886,7 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
             nthread=self.nthread,
             cache_prefix=it.cache_prefix if it.cache_prefix else "",
             on_host=it.on_host,
+            min_cache_page_bytes=it.min_cache_page_bytes,
         )
         handle = ctypes.c_void_p()
         reset_callback, next_callback = it.get_callbacks(enable_categorical)
@@ -1093,7 +1040,7 @@ class DMatrix:  # pylint: disable=too-many-instance-attributes,too-many-public-m
 
         dispatch_meta_backend(self, data, field, "uint32")
 
-    def save_binary(self, fname: Union[str, os.PathLike], silent: bool = True) -> None:
+    def save_binary(self, fname: PathLike, silent: bool = True) -> None:
         """Save DMatrix to an XGBoost buffer.  Saved binary can be later loaded
         by providing the path to :py:func:`xgboost.DMatrix` as input.
 
@@ -1470,11 +1417,8 @@ class _ProxyDMatrix(DMatrix):
 
     def _ref_data_from_cuda_interface(self, data: DataType) -> None:
         """Reference data from CUDA array interface."""
-        interface = data.__cuda_array_interface__
-        interface_str = bytes(json.dumps(interface), "utf-8")
-        _check_call(
-            _LIB.XGProxyDMatrixSetDataCudaArrayInterface(self.handle, interface_str)
-        )
+        arrinf = cuda_array_interface(data)
+        _check_call(_LIB.XGProxyDMatrixSetDataCudaArrayInterface(self.handle, arrinf))
 
     def _ref_data_from_cuda_columnar(self, data: DataType, cat_codes: list) -> None:
         """Reference data from CUDA columnar format."""
@@ -1485,27 +1429,24 @@ class _ProxyDMatrix(DMatrix):
 
     def _ref_data_from_array(self, data: np.ndarray) -> None:
         """Reference data from numpy array."""
-        from .data import _array_interface
-
-        _check_call(
-            _LIB.XGProxyDMatrixSetDataDense(self.handle, _array_interface(data))
-        )
+        _check_call(_LIB.XGProxyDMatrixSetDataDense(self.handle, array_interface(data)))
 
     def _ref_data_from_pandas(self, data: DataType) -> None:
-        """Reference data from a pandas DataFrame. The input is a PandasTransformed instance."""
+        """Reference data from a pandas DataFrame. The input is a PandasTransformed
+        instance.
+
+        """
         _check_call(
             _LIB.XGProxyDMatrixSetDataColumnar(self.handle, data.array_interface())
         )
 
     def _ref_data_from_csr(self, csr: scipy.sparse.csr_matrix) -> None:
         """Reference data from scipy csr."""
-        from .data import _array_interface
-
         _LIB.XGProxyDMatrixSetDataCSR(
             self.handle,
-            _array_interface(csr.indptr),
-            _array_interface(csr.indices),
-            _array_interface(csr.data),
+            array_interface(csr.indptr),
+            array_interface(csr.indices),
+            array_interface(csr.data),
             ctypes.c_size_t(csr.shape[1]),
         )
 
@@ -1554,6 +1495,21 @@ class QuantileDMatrix(DMatrix):
         as a reference means that the same quantisation applied to the training data is
         applied to the validation/test data
 
+    max_quantile_batches :
+        For GPU-based inputs from an iterator, XGBoost handles incoming batches with
+        multiple growing substreams. This parameter sets the maximum number of batches
+        before XGBoost can cut the sub-stream and create a new one. This can help bound
+        the memory usage. By default, XGBoost grows new sub-streams exponentially until
+        batches are exhausted. Only used for the training dataset and the default is
+        None (unbounded). Lastly, if the `data` is a single batch instead of an
+        iterator, this parameter has no effect.
+
+        .. versionadded:: 3.0.0
+
+        .. warning::
+
+            This is an experimental parameter and subject to change.
+
     """
 
     @_deprecate_positional_args
@@ -1577,6 +1533,7 @@ class QuantileDMatrix(DMatrix):
         label_upper_bound: Optional[ArrayLike] = None,
         feature_weights: Optional[ArrayLike] = None,
         enable_categorical: bool = False,
+        max_quantile_batches: Optional[int] = None,
         data_split_mode: DataSplitMode = DataSplitMode.ROW,
     ) -> None:
         self.max_bin = max_bin
@@ -1628,6 +1585,7 @@ class QuantileDMatrix(DMatrix):
             feature_names=feature_names,
             feature_types=feature_types,
             enable_categorical=enable_categorical,
+            max_quantile_blocks=max_quantile_batches,
         )
 
     def _init(
@@ -1635,6 +1593,7 @@ class QuantileDMatrix(DMatrix):
         data: DataType,
         ref: Optional[DMatrix],
         enable_categorical: bool,
+        max_quantile_blocks: Optional[int],
         **meta: Any,
     ) -> None:
         from .data import (
@@ -1662,7 +1621,10 @@ class QuantileDMatrix(DMatrix):
             )
 
         config = make_jcargs(
-            nthread=self.nthread, missing=self.missing, max_bin=self.max_bin
+            nthread=self.nthread,
+            missing=self.missing,
+            max_bin=self.max_bin,
+            max_quantile_blocks=max_quantile_blocks,
         )
         ret = _LIB.XGQuantileDMatrixCreateFromCallback(
             None,
@@ -1687,7 +1649,7 @@ class ExtMemQuantileDMatrix(DMatrix):
 
     .. warning::
 
-        This is an experimental feature.
+        This is an experimental feature and subject to change.
 
     .. versionadded:: 3.0.0
 
@@ -1703,6 +1665,8 @@ class ExtMemQuantileDMatrix(DMatrix):
         max_bin: Optional[int] = None,
         ref: Optional[DMatrix] = None,
         enable_categorical: bool = False,
+        max_num_device_pages: Optional[int] = None,
+        max_quantile_batches: Optional[int] = None,
     ) -> None:
         """
         Parameters
@@ -1710,22 +1674,51 @@ class ExtMemQuantileDMatrix(DMatrix):
         data :
             A user-defined :py:class:`DataIter` for loading data.
 
+        max_num_device_pages :
+            For a GPU-based validation dataset, XGBoost can optionally cache some pages
+            in device memory instead of host memory to reduce data transfer. Each cached
+            page has size of `min_cache_page_bytes`. Set this to 0 if you don't want
+            pages to be cached in the device memory. This can be useful for preventing
+            OOM error where there are more than one validation datasets. The default
+            number of device-based page is 1. Lastly, XGBoost infers whether a dataset
+            is used for valdiation by checking whether ref is not None.
+
+        max_quantile_batches :
+            See :py:class:`QuantileDMatrix`.
+
         """
         self.max_bin = max_bin
         self.missing = missing if missing is not None else np.nan
         self.nthread = nthread if nthread is not None else -1
 
-        self._init(data, ref, enable_categorical)
+        self._init(
+            data,
+            ref,
+            enable_categorical=enable_categorical,
+            max_num_device_pages=max_num_device_pages,
+            max_quantile_blocks=max_quantile_batches,
+        )
         assert self.handle is not None
 
     def _init(
-        self, it: DataIter, ref: Optional[DMatrix], enable_categorical: bool
+        self,
+        it: DataIter,
+        ref: Optional[DMatrix],
+        *,
+        enable_categorical: bool,
+        max_num_device_pages: Optional[int] = None,
+        max_quantile_blocks: Optional[int] = None,
     ) -> None:
         args = make_jcargs(
             missing=self.missing,
             nthread=self.nthread,
             cache_prefix=it.cache_prefix if it.cache_prefix else "",
             on_host=it.on_host,
+            max_bin=self.max_bin,
+            min_cache_page_bytes=it.min_cache_page_bytes,
+            max_num_device_pages=max_num_device_pages,
+            # It's called blocks internally due to block-based quantile sketching.
+            max_quantile_blocks=max_quantile_blocks,
         )
         handle = ctypes.c_void_p()
         reset_callback, next_callback = it.get_callbacks(enable_categorical)
@@ -1928,7 +1921,8 @@ class Booster:
         self.__dict__.update(state)
 
     def __getitem__(self, val: Union[Integer, tuple, slice, EllipsisType]) -> "Booster":
-        """Get a slice of the tree-based model.
+        """Get a slice of the tree-based model. Attributes like `best_iteration` and
+        `best_score` are removed in the resulting booster.
 
         .. versionadded:: 1.3.0
 
@@ -2026,6 +2020,15 @@ class Booster:
             A copied booster model
         """
         return copy.copy(self)
+
+    def reset(self) -> "Booster":
+        """Reset the booster object to release data caches used for training.
+
+        .. versionadded:: 3.0.0
+
+        """
+        _check_call(_LIB.XGBoosterReset(self.handle))
+        return self
 
     def attr(self, key: str) -> Optional[str]:
         """Get attribute string from the Booster.
@@ -2221,19 +2224,14 @@ class Booster:
             The second order of gradient.
 
         """
-        from .data import (
-            _array_interface,
-            _cuda_array_interface,
-            _ensure_np_dtype,
-            _is_cupy_alike,
-        )
+        from .data import _ensure_np_dtype, _is_cupy_alike
 
         self._assign_dmatrix_features(dtrain)
 
         def is_flatten(array: NumpyOrCupy) -> bool:
             return len(array.shape) == 1 or array.shape[1] == 1
 
-        def array_interface(array: NumpyOrCupy) -> bytes:
+        def grad_arrinf(array: NumpyOrCupy) -> bytes:
             # Can we check for __array_interface__ instead of a specific type instead?
             msg = (
                 "Expecting `np.ndarray` or `cupy.ndarray` for gradient and hessian."
@@ -2253,9 +2251,9 @@ class Booster:
 
             if isinstance(array, np.ndarray):
                 array, _ = _ensure_np_dtype(array, array.dtype)
-                interface = _array_interface(array)
+                interface = array_interface(array)
             elif _is_cupy_alike(array):
-                interface = _cuda_array_interface(array)
+                interface = cuda_array_interface(array)
             else:
                 raise TypeError(msg)
 
@@ -2266,8 +2264,8 @@ class Booster:
                 self.handle,
                 dtrain.handle,
                 iteration,
-                array_interface(grad),
-                array_interface(hess),
+                grad_arrinf(grad),
+                grad_arrinf(hess),
             )
         )
 
@@ -2585,10 +2583,10 @@ class Booster:
 
         from .data import (
             PandasTransformed,
-            _array_interface,
             _arrow_transform,
             _is_arrow,
             _is_cudf_df,
+            _is_cudf_pandas,
             _is_cupy_alike,
             _is_list,
             _is_np_array_like,
@@ -2597,6 +2595,9 @@ class Booster:
             _is_tuple,
             _transform_pandas_df,
         )
+
+        if _is_cudf_pandas(data):
+            data = data._fsproxy_fast  # pylint: disable=protected-access
 
         enable_categorical = True
         if _is_arrow(data):
@@ -2630,7 +2631,7 @@ class Booster:
             _check_call(
                 _LIB.XGBoosterPredictFromDense(
                     self.handle,
-                    _array_interface(data),
+                    array_interface(data),
                     args,
                     p_handle,
                     ctypes.byref(shape),
@@ -2659,9 +2660,9 @@ class Booster:
             _check_call(
                 _LIB.XGBoosterPredictFromCSR(
                     self.handle,
-                    _array_interface(data.indptr),
-                    _array_interface(data.indices),
-                    _array_interface(data.data),
+                    array_interface(data.indptr),
+                    array_interface(data.indices),
+                    array_interface(data.data),
                     c_bst_ulong(data.shape[1]),
                     args,
                     p_handle,
@@ -2675,7 +2676,7 @@ class Booster:
             from .data import _transform_cupy_array
 
             data = _transform_cupy_array(data)
-            interface_str = _cuda_array_interface(data)
+            interface_str = cuda_array_interface(data)
             _check_call(
                 _LIB.XGBoosterPredictFromCudaArray(
                     self.handle,
@@ -2714,7 +2715,7 @@ class Booster:
             "Data type:" + str(type(data)) + " not supported by inplace prediction."
         )
 
-    def save_model(self, fname: Union[str, os.PathLike]) -> None:
+    def save_model(self, fname: PathLike) -> None:
         """Save the model to a file.
 
         The model is saved in an XGBoost internal format which is universal among the
@@ -2787,9 +2788,12 @@ class Booster:
             Input file name or memory buffer(see also save_raw)
 
         """
-        if isinstance(fname, (str, os.PathLike)):
-            # assume file name, cannot use os.path.exist to check, file can be
-            # from URL.
+
+        def is_pathlike(path: ModelIn) -> TypeGuard[os.PathLike[str]]:
+            return isinstance(path, os.PathLike)
+
+        if isinstance(fname, str) or is_pathlike(fname):
+            # assume file name, cannot use os.path.exist to check, file can be from URL.
             fname = os.fspath(os.path.expanduser(fname))
             _check_call(_LIB.XGBoosterLoadModel(self.handle, c_str(fname)))
         elif isinstance(fname, bytearray):
@@ -2849,8 +2853,8 @@ class Booster:
 
     def dump_model(
         self,
-        fout: Union[str, os.PathLike],
-        fmap: Union[str, os.PathLike] = "",
+        fout: PathLike,
+        fmap: PathLike = "",
         with_stats: bool = False,
         dump_format: str = "text",
     ) -> None:
@@ -2894,7 +2898,7 @@ class Booster:
 
     def get_dump(
         self,
-        fmap: Union[str, os.PathLike] = "",
+        fmap: PathLike = "",
         with_stats: bool = False,
         dump_format: str = "text",
     ) -> List[str]:
@@ -2907,7 +2911,7 @@ class Booster:
         fmap :
             Name of the file containing feature map names.
         with_stats :
-            Controls whether the split statistics are output.
+            Controls whether the split statistics should be included.
         dump_format :
             Format of model dump. Can be 'text', 'json' or 'dot'.
 
@@ -2928,9 +2932,7 @@ class Booster:
         res = from_cstr_to_pystr(sarr, length)
         return res
 
-    def get_fscore(
-        self, fmap: Union[str, os.PathLike] = ""
-    ) -> Dict[str, Union[float, List[float]]]:
+    def get_fscore(self, fmap: PathLike = "") -> Dict[str, Union[float, List[float]]]:
         """Get feature importance of each feature.
 
         .. note:: Zero-importance features will not be included
@@ -2947,7 +2949,7 @@ class Booster:
         return self.get_score(fmap, importance_type="weight")
 
     def get_score(
-        self, fmap: Union[str, os.PathLike] = "", importance_type: str = "weight"
+        self, fmap: PathLike = "", importance_type: str = "weight"
     ) -> Dict[str, Union[float, List[float]]]:
         """Get feature importance of each feature.
         For tree model Importance type can be defined as:
@@ -3012,7 +3014,7 @@ class Booster:
         return results
 
     # pylint: disable=too-many-statements
-    def trees_to_dataframe(self, fmap: Union[str, os.PathLike] = "") -> DataFrame:
+    def trees_to_dataframe(self, fmap: PathLike = "") -> DataFrame:
         """Parse a boosted tree model text dump into a pandas DataFrame structure.
 
         This feature is only defined when the decision tree model is chosen as base
@@ -3120,11 +3122,7 @@ class Booster:
             }
         )
 
-        if callable(getattr(df, "sort_values", None)):
-            # pylint: disable=no-member
-            return df.sort_values(["Tree", "Node"]).reset_index(drop=True)
-        # pylint: disable=no-member
-        return df.sort(["Tree", "Node"]).reset_index(drop=True)
+        return df.sort_values(["Tree", "Node"]).reset_index(drop=True)
 
     def _assign_dmatrix_features(self, data: DMatrix) -> None:
         if data.num_row() == 0:
@@ -3178,7 +3176,7 @@ class Booster:
     def get_split_value_histogram(
         self,
         feature: str,
-        fmap: Union[os.PathLike, str] = "",
+        fmap: PathLike = "",
         bins: Optional[int] = None,
         as_pandas: bool = True,
     ) -> Union[np.ndarray, DataFrame]:
@@ -3203,6 +3201,8 @@ class Booster:
         a histogram of used splitting values for the specified feature
         either as numpy array or pandas DataFrame.
         """
+        from .data import CAT_T
+
         xgdump = self.get_dump(fmap=fmap)
         values = []
         # pylint: disable=consider-using-f-string
@@ -3230,7 +3230,7 @@ class Booster:
             except (ValueError, AttributeError, TypeError):
                 # None.index: attr err, None[0]: type err, fn.index(-1): value err
                 feature_t = None
-            if feature_t == "c":  # categorical
+            if feature_t == CAT_T:  # categorical
                 raise ValueError(
                     "Split value historgam doesn't support categorical split."
                 )

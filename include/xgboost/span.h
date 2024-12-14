@@ -37,6 +37,7 @@
 #include <limits>  // numeric_limits
 #include <type_traits>
 #include <utility>  // for move
+#include <vector>   // for vector
 
 #if defined(__CUDACC__)
 #include <cuda_runtime.h>
@@ -112,7 +113,16 @@ namespace xgboost::common {
 
 #else
 
+#if defined(__SYCL_DEVICE_ONLY__)
+
+// SYCL doesn't support termination
+#define SYCL_KERNEL_CHECK(cond)
+
+#define KERNEL_CHECK(cond) SYCL_KERNEL_CHECK(cond)
+
+#else  // defined(__SYCL_DEVICE_ONLY__)
 #define KERNEL_CHECK(cond) (XGBOOST_EXPECT((cond), true) ? static_cast<void>(0) : std::terminate())
+#endif  // defined(__SYCL_DEVICE_ONLY__)
 
 #define SPAN_CHECK(cond) KERNEL_CHECK(cond)
 
@@ -433,7 +443,7 @@ class Span {
   using const_reverse_iterator = const std::reverse_iterator<const_iterator>;  // NOLINT
 
   // constructors
-  constexpr Span() __span_noexcept = default;
+  constexpr Span() = default;
 
   XGBOOST_DEVICE Span(pointer _ptr, index_type _count) :
       size_(_count), data_(_ptr) {
@@ -480,16 +490,11 @@ class Span {
       __span_noexcept : size_(_other.size()),
                         data_(_other.data()) {}
 
-  XGBOOST_DEVICE constexpr Span(const Span& _other)
-      __span_noexcept : size_(_other.size()), data_(_other.data()) {}
-
-  XGBOOST_DEVICE Span& operator=(const Span& _other) __span_noexcept {
-    size_ = _other.size();
-    data_ = _other.data();
-    return *this;
-  }
-
-  XGBOOST_DEVICE ~Span() __span_noexcept {};  // NOLINT
+  constexpr Span(Span const& _other) noexcept(true) = default;
+  constexpr Span& operator=(Span const& _other) noexcept(true) = default;
+  constexpr Span(Span&& _other) noexcept(true) = default;
+  constexpr Span& operator=(Span&& _other) noexcept(true) = default;
+  ~Span() noexcept(true) = default;
 
   XGBOOST_DEVICE constexpr iterator begin() const __span_noexcept {  // NOLINT
     return {this, 0};
@@ -703,6 +708,12 @@ class IterSpan {
     return it_ + size();
   }
 };
+
+template <typename T>
+Span(std::vector<T> const&) -> Span<T const>;
+
+template <typename T>
+Span(std::vector<T>&) -> Span<T>;
 }  // namespace xgboost::common
 
 

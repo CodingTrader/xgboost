@@ -6,6 +6,7 @@ ENABLE_STD_THREAD=1
 CXX_STD = CXX17
 
 XGB_RFLAGS = \
+    @DMLC_DEFS@ \
     -DXGBOOST_STRICT_R_MODE=1 \
     -DDMLC_LOG_BEFORE_THROW=0 \
     -DDMLC_ENABLE_STD_THREAD=$(ENABLE_STD_THREAD) \
@@ -71,6 +72,7 @@ OBJECTS= \
     $(PKGROOT)/src/data/gradient_index.o \
     $(PKGROOT)/src/data/gradient_index_page_source.o \
     $(PKGROOT)/src/data/gradient_index_format.o \
+    $(PKGROOT)/src/data/validation.o \
     $(PKGROOT)/src/data/sparse_page_dmatrix.o \
     $(PKGROOT)/src/data/sparse_page_source.o \
     $(PKGROOT)/src/data/extmem_quantile_dmatrix.o \

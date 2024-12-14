@@ -11,10 +11,24 @@
 #include "../../../src/common/transform_iterator.h"  // for MakeIndexTransformIter
 
 namespace xgboost::common {
+namespace {
+using ST = common::Span<int, dynamic_extent>;
+static_assert(std::is_trivially_copyable_v<ST>);
+static_assert(std::is_trivially_move_assignable_v<ST>);
+static_assert(std::is_trivially_move_constructible_v<ST>);
+static_assert(std::is_trivially_copy_assignable_v<ST>);
+static_assert(std::is_trivially_copy_constructible_v<ST>);
+}  // namespace
+
 TEST(Span, TestStatus) {
   int status = 1;
   TestTestStatus {&status}();
   ASSERT_EQ(status, -1);
+
+  std::vector<double> foo;
+  auto bar = Span{foo};
+  ASSERT_FALSE(bar.data());
+  ASSERT_EQ(bar.size(), 0);
 }
 
 TEST(Span, DlfConstructors) {

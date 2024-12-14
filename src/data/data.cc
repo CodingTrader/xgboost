@@ -35,6 +35,7 @@
 #include "../data/iterative_dmatrix.h"        // for IterativeDMatrix
 #include "./sparse_page_dmatrix.h"            // for SparsePageDMatrix
 #include "array_interface.h"                  // for ArrayInterfaceHandler, ArrayInterface, Dispa...
+#include "batch_utils.h"                      // for MatchingPageBytes
 #include "dmlc/base.h"                        // for BeginPtr
 #include "dmlc/common.h"                      // for OMPException
 #include "dmlc/data.h"                        // for Parser
@@ -538,7 +539,9 @@ void MetaInfo::SetInfoFromHost(Context const* ctx, StringView key, Json arr) {
   } else if (key == "label") {
     CopyTensorInfoImpl(ctx, arr, &this->labels);
     if (this->num_row_ != 0 && this->labels.Shape(0) != this->num_row_) {
-      CHECK_EQ(this->labels.Size() % this->num_row_, 0) << "Incorrect size for labels.";
+      CHECK_EQ(this->labels.Size() % this->num_row_, 0)
+          << "Incorrect size for labels: (" << this->labels.Shape(0) << "," << this->labels.Shape(1)
+          << ") v.s. " << this->num_row_;
       size_t n_targets = this->labels.Size() / this->num_row_;
       this->labels.Reshape(this->num_row_, n_targets);
     }
@@ -744,6 +747,10 @@ void MetaInfo::Extend(MetaInfo const& that, bool accumulate_rows, bool check_col
     this->feature_names = that.feature_names;
   }
 
+  if (!this->feature_types.Empty()) {
+    data::CheckFeatureTypes(this->feature_types, that.feature_types);
+  }
+
   if (!that.feature_type_names.empty()) {
     this->feature_type_names = that.feature_type_names;
     auto& h_feature_types = feature_types.HostVector();
@@ -763,7 +770,8 @@ void MetaInfo::Extend(MetaInfo const& that, bool accumulate_rows, bool check_col
   }
 }
 
-void MetaInfo::SynchronizeNumberOfColumns(Context const* ctx) {
+void MetaInfo::SynchronizeNumberOfColumns(Context const* ctx, DataSplitMode split_mode) {
+  this->data_split_mode = split_mode;
   auto op = IsColumnSplit() ? collective::Op::kSum : collective::Op::kMax;
   auto rc = collective::Allreduce(ctx, linalg::MakeVec(&num_col_, 1), op);
   collective::SafeColl(rc);
@@ -871,8 +879,8 @@ DMatrix* TryLoadBinary(std::string fname, bool silent) {
       if (magic == data::SimpleDMatrix::kMagic) {
         DMatrix* dmat = new data::SimpleDMatrix(&is);
         if (!silent) {
-          LOG(CONSOLE) << dmat->Info().num_row_ << 'x' << dmat->Info().num_col_ << " matrix with "
-                       << dmat->Info().num_nonzero_ << " entries loaded from " << fname;
+          LOG(INFO) << dmat->Info().num_row_ << 'x' << dmat->Info().num_col_ << " matrix with "
+                    << dmat->Info().num_nonzero_ << " entries loaded from " << fname;
         }
         return dmat;
       }
@@ -914,14 +922,14 @@ DMatrix* DMatrix::Load(const std::string& uri, bool silent, DataSplitMode data_s
     CHECK(data_split_mode != DataSplitMode::kCol)
         << "Column-wise data split is not supported for external memory.";
     data::FileIterator iter{fname, static_cast<uint32_t>(partid), static_cast<uint32_t>(npart)};
-    dmat = new data::SparsePageDMatrix{&iter,
-                                       iter.Proxy(),
-                                       data::fileiter::Reset,
-                                       data::fileiter::Next,
-                                       std::numeric_limits<float>::quiet_NaN(),
-                                       1,
-                                       cache_file,
-                                       false};
+    auto config = ExtMemConfig{cache_file,
+                               false,
+                               cuda_impl::MatchingPageBytes(),
+                               std::numeric_limits<float>::quiet_NaN(),
+                               cuda_impl::MaxNumDevicePages(),
+                               1};
+    dmat = new data::SparsePageDMatrix{&iter, iter.Proxy(), data::fileiter::Reset,
+                                       data::fileiter::Next, config};
   }
 
   return dmat;
@@ -931,44 +939,44 @@ template <typename DataIterHandle, typename DMatrixHandle, typename DataIterRese
           typename XGDMatrixCallbackNext>
 DMatrix* DMatrix::Create(DataIterHandle iter, DMatrixHandle proxy, std::shared_ptr<DMatrix> ref,
                          DataIterResetCallback* reset, XGDMatrixCallbackNext* next, float missing,
-                         int nthread, bst_bin_t max_bin) {
-  return new data::IterativeDMatrix(iter, proxy, ref, reset, next, missing, nthread, max_bin);
+                         int nthread, bst_bin_t max_bin, std::int64_t max_quantile_blocks) {
+  return new data::IterativeDMatrix(iter, proxy, ref, reset, next, missing, nthread, max_bin,
+                                    max_quantile_blocks);
 }
 
 template <typename DataIterHandle, typename DMatrixHandle, typename DataIterResetCallback,
           typename XGDMatrixCallbackNext>
 DMatrix* DMatrix::Create(DataIterHandle iter, DMatrixHandle proxy, DataIterResetCallback* reset,
-                         XGDMatrixCallbackNext* next, float missing, int32_t n_threads,
-                         std::string cache, bool on_host) {
-  return new data::SparsePageDMatrix{iter, proxy, reset, next, missing, n_threads, cache, on_host};
+                         XGDMatrixCallbackNext* next, ExtMemConfig const& config) {
+  return new data::SparsePageDMatrix{iter, proxy, reset, next, config};
 }
 
 template <typename DataIterHandle, typename DMatrixHandle, typename DataIterResetCallback,
           typename XGDMatrixCallbackNext>
 DMatrix* DMatrix::Create(DataIterHandle iter, DMatrixHandle proxy, std::shared_ptr<DMatrix> ref,
-                         DataIterResetCallback* reset, XGDMatrixCallbackNext* next, float missing,
-                         std::int32_t nthread, bst_bin_t max_bin, std::string cache, bool on_host) {
+                         DataIterResetCallback* reset, XGDMatrixCallbackNext* next,
+                         bst_bin_t max_bin, std::int64_t max_quantile_blocks,
+                         ExtMemConfig const& config) {
   return new data::ExtMemQuantileDMatrix{
-      iter, proxy, ref, reset, next, missing, nthread, std::move(cache), max_bin, on_host};
+      iter, proxy, ref, reset, next, max_bin, max_quantile_blocks, config};
 }
 
-template DMatrix* DMatrix::Create<DataIterHandle, DMatrixHandle, DataIterResetCallback,
-                                  XGDMatrixCallbackNext>(DataIterHandle iter, DMatrixHandle proxy,
-                                                         std::shared_ptr<DMatrix> ref,
-                                                         DataIterResetCallback* reset,
-                                                         XGDMatrixCallbackNext* next, float missing,
-                                                         int nthread, int max_bin);
+template DMatrix*
+DMatrix::Create<DataIterHandle, DMatrixHandle, DataIterResetCallback, XGDMatrixCallbackNext>(
+    DataIterHandle iter, DMatrixHandle proxy, std::shared_ptr<DMatrix> ref,
+    DataIterResetCallback* reset, XGDMatrixCallbackNext* next, float missing, int nthread,
+    int max_bin, std::int64_t max_quantile_blocks);
 
 template DMatrix* DMatrix::Create<DataIterHandle, DMatrixHandle, DataIterResetCallback,
                                   XGDMatrixCallbackNext>(DataIterHandle iter, DMatrixHandle proxy,
                                                          DataIterResetCallback* reset,
-                                                         XGDMatrixCallbackNext* next, float missing,
-                                                         int32_t n_threads, std::string, bool);
+                                                         XGDMatrixCallbackNext* next,
+                                                         ExtMemConfig const&);
 
 template DMatrix*
 DMatrix::Create<DataIterHandle, DMatrixHandle, DataIterResetCallback, XGDMatrixCallbackNext>(
     DataIterHandle, DMatrixHandle, std::shared_ptr<DMatrix>, DataIterResetCallback*,
-    XGDMatrixCallbackNext*, float, std::int32_t, bst_bin_t, std::string, bool);
+    XGDMatrixCallbackNext*, bst_bin_t, std::int64_t, ExtMemConfig const&);
 
 template <typename AdapterT>
 DMatrix* DMatrix::Create(AdapterT* adapter, float missing, int nthread, const std::string&,
@@ -986,7 +994,6 @@ INSTANTIATION_CREATE(DenseAdapter)
 INSTANTIATION_CREATE(ArrayAdapter)
 INSTANTIATION_CREATE(CSRAdapter)
 INSTANTIATION_CREATE(CSCAdapter)
-INSTANTIATION_CREATE(DataTableAdapter)
 INSTANTIATION_CREATE(FileAdapter)
 INSTANTIATION_CREATE(CSRArrayAdapter)
 INSTANTIATION_CREATE(CSCArrayAdapter)
@@ -1264,8 +1271,6 @@ template uint64_t SparsePage::Push(const data::CSRArrayAdapterBatch& batch, floa
 template uint64_t SparsePage::Push(const data::CSCArrayAdapterBatch& batch, float missing,
                                    int nthread);
 template uint64_t SparsePage::Push(const data::CSCAdapterBatch& batch, float missing, int nthread);
-template uint64_t SparsePage::Push(const data::DataTableAdapterBatch& batch, float missing,
-                                   int nthread);
 template uint64_t SparsePage::Push(const data::FileAdapterBatch& batch, float missing, int nthread);
 template uint64_t SparsePage::Push(const data::ColumnarAdapterBatch& batch, float missing,
                                    std::int32_t nthread);

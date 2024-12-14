@@ -21,7 +21,7 @@
 #include "../common/hist_util.h"        // for HistogramCuts
 #include "../common/random.h"           // for ColumnSampler, GlobalRandom
 #include "../common/timer.h"
-#include "../data/batch_utils.cuh"  // for StaticBatch
+#include "../data/batch_utils.h"  // for StaticBatch
 #include "../data/ellpack_page.cuh"
 #include "../data/ellpack_page.h"
 #include "constraints.cuh"
@@ -51,7 +51,7 @@ DMLC_REGISTRY_FILE_TAG(updater_gpu_hist);
 
 using cuda_impl::ApproxBatch;
 using cuda_impl::HistBatch;
-using data::cuda_impl::StaticBatch;
+using xgboost::cuda_impl::StaticBatch;
 
 // Extra data for each node that is passed to the update position function
 struct NodeSplitData {
@@ -162,7 +162,7 @@ struct GPUHistMakerDevice {
         interaction_constraints(param, static_cast<bst_feature_t>(info.num_col_)),
         sampler{std::make_unique<GradientBasedSampler>(
             ctx, info.num_row_, batch_param, param.subsample, param.sampling_method,
-            batch_ptr_.size() > 2 && this->hist_param_->extmem_concat_pages)} {
+            batch_ptr_.size() > 2 && this->hist_param_->extmem_single_page)} {
     if (!param.monotone_constraints.empty()) {
       // Copy assigning an empty vector causes an exception in MSVC debug builds
       monotone_constraints = param.monotone_constraints;
@@ -826,10 +826,7 @@ class GPUHistMaker : public TreeUpdater {
     CHECK_GE(ctx_->Ordinal(), 0) << "Must have at least one device";
 
     // Synchronise the column sampling seed
-    std::uint32_t column_sampling_seed = common::GlobalRandom()();
-    SafeColl(collective::Broadcast(
-        ctx_, linalg::MakeVec(&column_sampling_seed, sizeof(column_sampling_seed)), 0));
-    this->column_sampler_ = std::make_shared<common::ColumnSampler>(column_sampling_seed);
+    this->column_sampler_ = common::MakeColumnSampler(ctx_);
 
     curt::SetDevice(ctx_->Ordinal());
     p_fmat->Info().feature_types.SetDevice(ctx_->Device());
@@ -968,8 +965,7 @@ class GPUGlobalApproxMaker : public TreeUpdater {
 
     monitor_.Start(__func__);
     CHECK(ctx_->IsCUDA()) << error::InvalidCUDAOrdinal();
-    uint32_t column_sampling_seed = common::GlobalRandom()();
-    this->column_sampler_ = std::make_shared<common::ColumnSampler>(column_sampling_seed);
+    this->column_sampler_ = common::MakeColumnSampler(ctx_);
 
     p_last_fmat_ = p_fmat;
     initialised_ = true;

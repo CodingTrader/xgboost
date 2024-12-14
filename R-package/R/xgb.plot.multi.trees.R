@@ -23,6 +23,7 @@
 #' @inheritParams xgb.plot.tree
 #' @param features_keep Number of features to keep in each position of the multi trees,
 #'   by default 5.
+#' @param render Should the graph be rendered or not? The default is `TRUE`.
 #' @inherit xgb.plot.tree return
 #'
 #' @examples
@@ -35,13 +36,15 @@
 #'
 #' bst <- xgb.train(
 #'   data = xgb.DMatrix(agaricus.train$data, label = agaricus.train$label),
-#'   max_depth = 15,
-#'   eta = 1,
-#'   nthread = nthread,
 #'   nrounds = 30,
-#'   objective = "binary:logistic",
-#'   min_child_weight = 50,
-#'   verbose = 0
+#'   verbose = 0,
+#'   params = xgb.params(
+#'     max_depth = 15,
+#'     eta = 1,
+#'     nthread = nthread,
+#'     objective = "binary:logistic",
+#'     min_child_weight = 50
+#'   )
 #' )
 #'
 #' p <- xgb.plot.multi.trees(model = bst, features_keep = 3)
@@ -64,7 +67,7 @@ xgb.plot.multi.trees <- function(model, features_keep = 5, plot_width = NULL, pl
   if (!requireNamespace("DiagrammeR", quietly = TRUE)) {
     stop("DiagrammeR is required for xgb.plot.multi.trees")
   }
-  check.deprecation(...)
+  check.deprecation(deprecated_multitrees_params, match.call(), ...)
   tree.matrix <- xgb.model.dt.tree(model = model)
 
   # first number of the path represents the tree, then the following numbers are related to the path to follow

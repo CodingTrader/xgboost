@@ -608,13 +608,13 @@ auto MakeTensorView(Context const *ctx, Order order, common::Span<T, ext> data, 
 
 template <typename T, typename... S>
 auto MakeTensorView(Context const *ctx, HostDeviceVector<T> *data, S &&...shape) {
-  auto span = ctx->IsCUDA() ? data->DeviceSpan() : data->HostSpan();
+  auto span = ctx->IsCPU() ? data->HostSpan() : data->DeviceSpan();
   return MakeTensorView(ctx->Device(), span, std::forward<S>(shape)...);
 }
 
 template <typename T, typename... S>
 auto MakeTensorView(Context const *ctx, HostDeviceVector<T> const *data, S &&...shape) {
-  auto span = ctx->IsCUDA() ? data->ConstDeviceSpan() : data->ConstHostSpan();
+  auto span = ctx->IsCPU() ? data->ConstHostSpan() : data->ConstDeviceSpan();
   return MakeTensorView(ctx->Device(), span, std::forward<S>(shape)...);
 }
 
@@ -855,22 +855,22 @@ class Tensor {
    * @brief Get a @ref TensorView for this tensor.
    */
   auto View(DeviceOrd device) {
-    if (device.IsCUDA()) {
-      data_.SetDevice(device);
-      auto span = data_.DeviceSpan();
+    if (device.IsCPU()) {
+      auto span = data_.HostSpan();
       return TensorView<T, kDim>{span, shape_, device, order_};
     } else {
-      auto span = data_.HostSpan();
+      data_.SetDevice(device);
+      auto span = data_.DeviceSpan();
       return TensorView<T, kDim>{span, shape_, device, order_};
     }
   }
   auto View(DeviceOrd device) const {
-    if (device.IsCUDA()) {
-      data_.SetDevice(device);
-      auto span = data_.ConstDeviceSpan();
+    if (device.IsCPU()) {
+      auto span = data_.ConstHostSpan();
       return TensorView<T const, kDim>{span, shape_, device, order_};
     } else {
-      auto span = data_.ConstHostSpan();
+      data_.SetDevice(device);
+      auto span = data_.ConstDeviceSpan();
       return TensorView<T const, kDim>{span, shape_, device, order_};
     }
   }
